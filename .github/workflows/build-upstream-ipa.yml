@@ -1,12 +1,17 @@
 name: Build upstream unsigned IPA
 
-# 已停用：正在进行 Expo 57 升级优化，完成前停止自动打包
-# 自研 Expo 57 版本的 CI 可参考 ci-ipa 分支
+# 已停用：正在进行 Expo 57 升级优化，完成前停止自动打包（沿用 74ba6be0 的决定）
+# 确认升级稳定后，取消下面 schedule 两行的注释即可恢复定时构建
 on:
+  # Scheduled events are best effort and get dropped under load, so ask twice
+  # a day. Resolving costs one cheap ubuntu job; only a real build reaches macOS.
+  # schedule:
+  #   - cron: '37 8 * * *'
+  #   - cron: '37 20 * * *'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Upstream Bangumi tag to build, for example 8.32.3. Leave empty for latest semantic tag.'
+        description: 'Upstream Bangumi tag to build, for example 8.32.3. Leave empty to pick the newest tag that has no IPA yet.'
         required: false
         type: string
       force:
@@ -14,23 +19,45 @@ on:
         required: false
         default: false
         type: boolean
+      rebuild_altstore:
+        description: 'Rebuild alt_store.json from every release instead of updating one version.'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Build and validate only. Publishes nothing: no release assets, no AltStore commit. The IPA comes back as a workflow artifact.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
+# One run at a time: the AltStore job pushes to master, and two runs racing on
+# that push is the one failure this workflow cannot retry its way out of.
 concurrency:
-  group: build-upstream-ipa-${{ github.event.inputs.tag || 'latest' }}
+  group: build-upstream-ipa
   cancel-in-progress: false
 
+env:
+  NODE_VERSION: '20'
+  # Pinned on purpose. The runner image rolls Xcode forward without warning and
+  # this build targets an Expo 52 / RN 0.76 native stack.
+  XCODE_VERSION: '26.6'
+
 jobs:
-  build:
-    name: Build unsigned IPA
-    if: false
-    runs-on: macos-26
-    timeout-minutes: 180
+  resolve:
+    name: Resolve upstream tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+      asset_name: ${{ steps.upstream.outputs.asset_name }}
+      sha_name: ${{ steps.upstream.outputs.sha_name }}
+      metadata_name: ${{ steps.upstream.outputs.metadata_name }}
+      should_build: ${{ steps.upstream.outputs.should_build }}
+      altstore_needs_update: ${{ steps.upstream.outputs.altstore_needs_update }}
 
     steps:
       - name: Checkout automation
@@ -39,31 +66,68 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Resolve upstream tag
         id: upstream
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REQUESTED_TAG: ${{ github.event.inputs.tag || '' }}
-          FORCE_REBUILD: ${{ github.event.inputs.force == 'true' }}
+          REQUESTED_TAG: ${{ inputs.tag || '' }}
+          FORCE_REBUILD: ${{ inputs.force == true }}
         run: node .github/scripts/upstream-ipa.mjs resolve
 
-      - name: Skip existing IPA
-        if: steps.upstream.outputs.should_build != 'true'
-        run: echo "IPA asset ${{ steps.upstream.outputs.asset_name }} already exists on release ${{ steps.upstream.outputs.release_tag }}."
+      - name: Summarise
+        run: |
+          {
+            echo "### Upstream IPA"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${{ steps.upstream.outputs.tag }}\` |"
+            echo "| Build IPA | ${{ steps.upstream.outputs.should_build }} |"
+            echo "| Update AltStore source | ${{ steps.upstream.outputs.altstore_needs_update }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build unsigned IPA
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          developer_dir="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+
+          if [ ! -d "$developer_dir" ]; then
+            echo "::error::Xcode $XCODE_VERSION is not installed on this runner image. Available: $(ls -d /Applications/Xcode*.app | tr '\n' ' ')"
+            exit 1
+          fi
+
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$developer_dir" xcodebuild -version
 
       - name: Download upstream source
-        if: steps.upstream.outputs.should_build == 'true'
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           source_zip="$RUNNER_TEMP/bangumi-$TAG.zip"
           source_dir="$RUNNER_TEMP/Bangumi-$TAG"
 
           rm -rf "$source_dir" "$source_zip"
-          curl -fsSL "https://github.com/czy0729/Bangumi/archive/refs/tags/$TAG.zip" -o "$source_zip"
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://github.com/czy0729/Bangumi/archive/refs/tags/$TAG.zip" -o "$source_zip"
           unzip -q "$source_zip" -d "$RUNNER_TEMP"
 
           if [ ! -d "$source_dir" ]; then
@@ -71,13 +135,16 @@ jobs:
             exit 1
           fi
 
+          # The archive stores packages/*/patches/*.patch as symlinks into
+          # packages/patches; patch-package needs real files.
           while IFS= read -r -d '' link; do
             target="$(readlink -f "$link")"
             if [ -n "$target" ] && [ -e "$target" ]; then
               rm "$link"
-              cp "$target" "$link"
+              cp -R "$target" "$link"
             else
-              echo "::warning::Broken symlink in upstream source: $link"
+              echo "::error::Broken symlink in upstream source: $link"
+              exit 1
             fi
           done < <(find "$source_dir" -type l -print0)
 
@@ -93,127 +160,127 @@ jobs:
           echo "SOURCE_DIR=$source_dir" >> "$GITHUB_ENV"
 
       - name: Prepare IPA source
-        if: steps.upstream.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
-          cd "$SOURCE_DIR"
+        env:
+          # The dependency set lives here, not in the tag being built.
+          IPA_PACKAGE_JSON: ${{ github.workspace }}/packages/ipa/package.json
+          # The tag is the release identity; app.json has been cut without a bump before.
+          UPSTREAM_TAG: ${{ needs.resolve.outputs.tag }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/prepare-ipa-source.mjs" source
 
-          node packages/env.js ipa
-
-          node <<'NODE'
-          const fs = require('fs')
-
-          function readJson(path) {
-            return JSON.parse(fs.readFileSync(path, 'utf8'))
-          }
-
-          function writeJson(path, value) {
-            fs.writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
-          }
-
-          function replaceInFile(path, from, to) {
-            if (!fs.existsSync(path)) return
-            const original = fs.readFileSync(path, 'utf8')
-            const patched = original.replace(from, to)
-            if (patched !== original) {
-              fs.writeFileSync(path, patched)
-              console.log(`Patched ${path}`)
-            }
-          }
-
-          const pkg = readJson('package.json')
-          pkg.dependencies ||= {}
-          if (!pkg.dependencies['expo-speech']) {
-            pkg.dependencies['expo-speech'] = '~13.0.1'
-            writeJson('package.json', pkg)
-            console.log('Added expo-speech for the IPA dependency set')
-          }
-
-          const appJson = readJson('app.json')
-          const plugins = appJson.expo?.plugins
-          if (Array.isArray(plugins)) {
-            const filtered = plugins.filter(plugin => {
-              if (plugin === 'expo-web-browser') return false
-              return !(Array.isArray(plugin) && plugin[0] === 'expo-web-browser')
-            })
-
-            if (filtered.length !== plugins.length) {
-              appJson.expo.plugins = filtered
-              writeJson('app.json', appJson)
-              console.log('Removed expo-web-browser config plugin for Expo 52 IPA builds')
-            }
-          }
-
-          const appVersion = appJson.expo?.version
-          if (!appVersion) {
-            throw new Error('app.json is missing expo.version')
-          }
-
-          replaceInFile(
-            'src/utils/thirdParty/file-system/index.ts',
-            'expo-file-system/legacy',
-            'expo-file-system',
-          )
-          replaceInFile(
-            'src/utils/worklets/index.ts',
-            "(require('react-native-worklets') as typeof import('react-native-worklets')).scheduleOnRN",
-            'reanimatedScheduleOnRN',
-          )
-          replaceInFile(
-            'src/utils/worklets/index.ts',
-            "(require('react-native-worklets') as typeof import('react-native-worklets')).scheduleOnUI",
-            'reanimatedScheduleOnUI',
-          )
-
-          fs.appendFileSync(process.env.GITHUB_ENV, `APP_VERSION=${appVersion}\n`)
-          NODE
-
-          app_version="$(node -p "require('./app.json').expo.version")"
-          plutil -replace CFBundleShortVersionString -string "$app_version" ios/Bangumi/Info.plist
-          echo "Synced iOS bundle version to app.json: $app_version"
-
-          node_binary="$(command -v node)"
-          {
-            printf 'export NODE_BINARY='
-            printf '%q' "$node_binary"
-            printf '\n'
-          } > ios/.xcode.env.local
-          echo "NODE_BINARY=$node_binary" >> "$GITHUB_ENV"
-          echo "Using Node for Xcode scripts: $node_binary"
+      - name: Restore yarn cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Yarn
+          key: yarn-${{ runner.os }}-${{ hashFiles('.github/ipa/yarn.lock') }}
+          restore-keys: yarn-${{ runner.os }}-
 
       - name: Install JavaScript dependencies
-        if: steps.upstream.outputs.should_build == 'true'
+        id: install
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
 
           corepack enable
           corepack prepare yarn@1.22.22 --activate
-          yarn --version
-          yarn install --ignore-engines --ignore-scripts --network-timeout 600000
-          ./node_modules/.bin/patch-package --patch-dir packages/ipa/patches || echo "::warning::Some IPA patch-package patches did not apply; continuing for iOS build."
+
+          # The upstream repo ships no lockfile, so every build used to re-resolve
+          # every semver range from scratch. Carry our own lockfile instead, and
+          # only trust it while the IPA package set it was generated from is unchanged.
+          lock_source="$GITHUB_WORKSPACE/.github/ipa/yarn.lock"
+          lock_meta="$GITHUB_WORKSPACE/.github/ipa/yarn.lock.meta.json"
+          package_hash="$(shasum -a 256 package.json | awk '{print $1}')"
+          frozen=""
+
+          if [ -f "$lock_source" ]; then
+            cp "$lock_source" yarn.lock
+            recorded="$(node -p "require('$lock_meta').packageJsonSha256" 2>/dev/null || echo '')"
+
+            if [ "$recorded" = "$package_hash" ]; then
+              frozen="--frozen-lockfile"
+              echo "Using the committed lockfile (package set unchanged)."
+            else
+              echo "::warning::The IPA package set changed since .github/ipa/yarn.lock was generated; resolving on top of it. Refresh the lockfile from this run's ipa-lockfile artifact."
+            fi
+          else
+            echo "::warning::No committed lockfile at .github/ipa/yarn.lock; this build is not reproducible."
+          fi
+
+          if ! yarn install --ignore-engines --ignore-scripts --network-timeout 600000 $frozen; then
+            # A stale lockfile must not be able to break the daily build; fall
+            # back to a fresh resolve and hand the maintainer the new lockfile.
+            [ -n "$frozen" ] || exit 1
+            echo "::warning::--frozen-lockfile install failed; retrying with a fresh resolve."
+            frozen=""
+            yarn install --ignore-engines --ignore-scripts --network-timeout 600000
+          fi
+
+          if [ -z "$frozen" ]; then
+            mkdir -p "$RUNNER_TEMP/lockfile-update"
+            cp yarn.lock "$RUNNER_TEMP/lockfile-update/yarn.lock"
+            printf '{\n  "packageJsonSha256": "%s",\n  "generatedForTag": "%s"\n}\n' \
+              "$package_hash" "${{ needs.resolve.outputs.tag }}" \
+              > "$RUNNER_TEMP/lockfile-update/yarn.lock.meta.json"
+            echo "lockfile_refreshed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload refreshed lockfile
+        if: steps.install.outputs.lockfile_refreshed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-lockfile
+          path: ${{ runner.temp }}/lockfile-update
+          retention-days: 30
+
+      - name: Apply IPA patches
+        run: node "$GITHUB_WORKSPACE/.github/scripts/apply-ipa-patches.mjs"
+
+      # The tag's ios/ directory was generated by an Expo 52-era prebuild and is
+      # inert on Expo 53+: its Objective-C AppDelegate no longer creates a window
+      # or starts React Native, and the build stays green all the way to a blank
+      # app. Regenerate it for the dependency set actually being installed.
+      - name: Generate native project
+        env:
+          # Excludes the two Android-only blur libraries from iOS autolinking;
+          # they both export a BlurView class and cannot be linked together.
+          IPA_RN_CONFIG: ${{ github.workspace }}/react-native.config.js
+        run: node "$GITHUB_WORKSPACE/.github/scripts/prepare-ipa-source.mjs" native
+
+      - name: Restore CocoaPods cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ needs.resolve.outputs.tag }}
+          restore-keys: pods-${{ runner.os }}-
 
       - name: Install CocoaPods dependencies
-        if: steps.upstream.outputs.should_build == 'true'
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR/ios"
           pod install
 
+          # fmt gates a clang workaround on __apple_build_version__ < 14000029L,
+          # which modern Xcode toolchains fail. Explicit about every outcome:
+          # a silently skipped patch here used to surface as a compile error.
           fmt_base_h="Pods/fmt/include/fmt/base.h"
-          if [ -f "$fmt_base_h" ]; then
+          guard='defined(__apple_build_version__) && __apple_build_version__ < 14000029L'
+
+          if [ ! -f "$fmt_base_h" ]; then
+            echo "::notice::No Pods/fmt in this dependency set; skipping the fmt compatibility patch."
+          elif grep -qF "$guard" "$fmt_base_h"; then
             ruby -0777 -pi -e 'gsub("defined(__apple_build_version__) && __apple_build_version__ < 14000029L", "defined(__apple_build_version__)")' "$fmt_base_h"
-            echo "Patched fmt for Xcode clang compatibility"
+            echo "Patched fmt for Xcode clang compatibility."
+          else
+            echo "::notice::fmt no longer carries the __apple_build_version__ guard; skipping the compatibility patch."
           fi
 
       - name: Build Release app
-        if: steps.upstream.outputs.should_build == 'true'
         env:
           NODE_ENV: production
           ENTRY_FILE: index.js
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR/ios"
+          rm -rf "$RUNNER_TEMP/Bangumi.xcresult"
 
           xcodebuild \
             -workspace Bangumi.xcworkspace \
@@ -225,16 +292,26 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             -derivedDataPath build \
+            -resultBundlePath "$RUNNER_TEMP/Bangumi.xcresult" \
             GCC_WARN_INHIBIT_ALL_WARNINGS=YES \
             CLANG_WARN_DOCUMENTATION_COMMENTS=NO \
             SWIFT_SUPPRESS_WARNINGS=YES \
-            COMPILER_INDEX_STORE_ENABLE=NO
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ needs.resolve.outputs.tag }}
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/Bangumi.xcresult
+          retention-days: 14
 
       - name: Package IPA
-        if: steps.upstream.outputs.should_build == 'true'
         env:
-          ASSET_NAME: ${{ steps.upstream.outputs.asset_name }}
-          TAG: ${{ steps.upstream.outputs.tag }}
+          ASSET_NAME: ${{ needs.resolve.outputs.asset_name }}
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
@@ -251,11 +328,11 @@ jobs:
           cp -R "$app_path" "$payload_root/Payload/"
 
           target_ipa="$GITHUB_WORKSPACE/$ASSET_NAME"
+          rm -f "$target_ipa"
           (cd "$payload_root" && zip -qr "$target_ipa" Payload)
 
-          app_version="$(node -p "require('./app.json').expo.version")"
-          if [ "$app_version" != "$TAG" ]; then
-            echo "::warning::app.json version $app_version does not match upstream tag $TAG."
+          if [ "$APP_VERSION" != "${{ needs.resolve.outputs.tag }}" ]; then
+            echo "::warning::app.json version $APP_VERSION does not match upstream tag ${{ needs.resolve.outputs.tag }}."
           fi
 
           cd "$GITHUB_WORKSPACE"
@@ -263,84 +340,114 @@ jobs:
 
           echo "IPA_PATH=$target_ipa" >> "$GITHUB_ENV"
           echo "SHA_PATH=$target_ipa.sha256" >> "$GITHUB_ENV"
+          echo "METADATA_PATH=$target_ipa.metadata.json" >> "$GITHUB_ENV"
 
       - name: Validate IPA
-        if: steps.upstream.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
+        run: bash .github/scripts/validate-ipa.sh "$IPA_PATH" "$APP_VERSION"
 
-          unzip -t "$IPA_PATH"
-          unzip -l "$IPA_PATH" "Payload/Bangumi.app/Info.plist" "Payload/Bangumi.app/EXConstants.bundle/app.config"
-
-          info_plist="$RUNNER_TEMP/Bangumi-Info.plist"
-          app_config="$RUNNER_TEMP/Bangumi-app.config"
-          unzip -p "$IPA_PATH" "Payload/Bangumi.app/Info.plist" > "$info_plist"
-          unzip -p "$IPA_PATH" "Payload/Bangumi.app/EXConstants.bundle/app.config" > "$app_config"
-
-          bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
-          app_version="$(node -p "require(process.env.SOURCE_DIR + '/app.json').expo.version")"
-          embedded_version="$(node -p "JSON.parse(require('fs').readFileSync(process.env.RUNNER_TEMP + '/Bangumi-app.config', 'utf8')).version")"
-
-          if [ "$bundle_version" != "$app_version" ]; then
-            echo "::error::Bundle version $bundle_version does not match app.json version $app_version."
-            exit 1
-          fi
-
-          if [ "$embedded_version" != "$app_version" ]; then
-            echo "::error::Embedded Expo config version $embedded_version does not match app.json version $app_version."
-            exit 1
-          fi
-
-          app_path="$SOURCE_DIR/ios/build/Build/Products/Release-iphoneos/Bangumi.app"
-          set +e
-          codesign_output="$(codesign -dv "$app_path" 2>&1)"
-          codesign_status="$?"
-          set -e
-
-          echo "$codesign_output"
-
-          if [ "$codesign_status" -eq 0 ]; then
-            echo "::error::Expected unsigned app, but codesign reported a valid signature."
-            exit 1
-          fi
-
-          if [[ "$codesign_output" != *"code object is not signed at all"* ]]; then
-            echo "::error::codesign did not report the expected unsigned-app message."
-            exit 1
-          fi
+      - name: Upload IPA artifact
+        if: inputs.dry_run == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ needs.resolve.outputs.tag }}
+          path: |
+            ${{ env.IPA_PATH }}
+            ${{ env.SHA_PATH }}
+            ${{ env.METADATA_PATH }}
+          retention-days: 14
 
       - name: Upload release assets
-        if: steps.upstream.outputs.should_build == 'true'
+        if: inputs.dry_run != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FORCE_REBUILD: ${{ github.event.inputs.force == 'true' }}
-          TAG: ${{ steps.upstream.outputs.tag }}
-        run: node .github/scripts/upstream-ipa.mjs upload --tag "$TAG" --ipa "$IPA_PATH" --sha "$SHA_PATH"
+          FORCE_REBUILD: ${{ inputs.force == true }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          node .github/scripts/upstream-ipa.mjs upload \
+            --tag "$TAG" \
+            --ipa "$IPA_PATH" \
+            --sha "$SHA_PATH" \
+            --metadata "$METADATA_PATH"
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Built \`${{ needs.resolve.outputs.tag }}\`"
+            echo
+            echo '```'
+            cat "$METADATA_PATH"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-altstore:
+    name: Update AltStore source
+    needs: [resolve, build]
+    # Runs when the AltStore source is behind, whether or not this run built
+    # anything. A run that uploaded assets and then failed here used to be
+    # unrecoverable: the next run saw the assets, skipped everything, and the
+    # AltStore source stayed stale until someone forced a rebuild by hand.
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && inputs.dry_run != true
+      && needs.resolve.outputs.altstore_needs_update == 'true'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v5
 
       - name: Update alt_store.json
-        if: steps.upstream.outputs.should_build == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.upstream.outputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          REBUILD_ALL: ${{ inputs.rebuild_altstore == true }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git fetch --depth=1 origin master
-          git reset --hard origin/master
-
-          python3 .github/scripts/generate-altstore.py \
-            --version "$TAG" \
-            --output alt_store.json
-
-          git add alt_store.json
-
-          if git diff --cached --quiet; then
-            echo "alt_store.json already up to date."
-            exit 0
+          rebuild_flag=""
+          if [ "$REBUILD_ALL" = "true" ]; then
+            rebuild_flag="--rebuild-all"
           fi
 
-          git commit -m "chore: update AltStore source $TAG"
-          git push origin HEAD:master
+          # The loop below resets the working tree to origin/master, which would
+          # otherwise swap the generator out from under us on a dispatch from a branch.
+          generator="$RUNNER_TEMP/generate-altstore.py"
+          cp .github/scripts/generate-altstore.py "$generator"
+
+          # Another job (or a human) can land on master between our fetch and our
+          # push, so regenerate on top of whatever master says and try again.
+          for attempt in 1 2 3 4 5; do
+            git fetch --depth=1 origin master
+            git reset --hard origin/master
+
+            python3 "$generator" \
+              --version "$TAG" \
+              --output alt_store.json \
+              $rebuild_flag
+
+            git add alt_store.json
+
+            if git diff --cached --quiet; then
+              echo "alt_store.json already up to date."
+              exit 0
+            fi
+
+            git commit -m "chore: update AltStore source $TAG"
+
+            if git push origin HEAD:master; then
+              echo "Published alt_store.json for $TAG."
+              exit 0
+            fi
+
+            echo "::notice::Push rejected on attempt $attempt; rebasing onto master and retrying."
+            sleep $((attempt * 5))
+          done
+
+          echo "::error::Could not push alt_store.json after 5 attempts."
+          exit 1

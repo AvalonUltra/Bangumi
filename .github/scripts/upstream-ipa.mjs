@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 
-import { appendFileSync, createReadStream, existsSync, statSync } from 'node:fs'
+import { appendFileSync, createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
+
 const upstreamRepo = 'czy0729/Bangumi'
 const semverTagPattern = /^\d+\.\d+\.\d+$/
 const apiBase = 'https://api.github.com'
 const apiVersion = '2022-11-28'
+
+/**
+ * How many of the newest upstream tags to consider. Only the newest tag used to
+ * be looked at, so a tag that landed while an earlier build was failing never
+ * got an IPA at all -- it was simply skipped forever.
+ */
+const tagScanLimit = Number(process.env.TAG_SCAN_LIMIT || 5)
+
+/** GitHub returns 5xx often enough that a single unlucky call should not fail a build. */
+const maxAttempts = Number(process.env.GITHUB_API_ATTEMPTS || 4)
 
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2))
@@ -19,53 +30,71 @@ async function main() {
     return
   }
 
-  throw new Error('Usage: upstream-ipa.mjs <resolve|upload> [--tag <x.y.z>] [--ipa <path>] [--sha <path>]')
+  throw new Error(
+    'Usage: upstream-ipa.mjs <resolve|upload> [--tag <x.y.z>] [--ipa <path>] [--sha <path>] [--metadata <path>]'
+  )
 }
 
 async function resolveCommand(options) {
   const requestedTag = (options.tag || process.env.REQUESTED_TAG || '').trim()
   const forceRebuild = isTruthy(process.env.FORCE_REBUILD)
   const tags = await listUpstreamSemverTags()
-  const tag = requestedTag || tags[0]
 
-  if (!semverTagPattern.test(tag)) {
-    throw new Error(`Upstream tag must match x.y.z, got: ${tag}`)
+  if (requestedTag && !semverTagPattern.test(requestedTag)) {
+    throw new Error(`Upstream tag must match x.y.z, got: ${requestedTag}`)
   }
 
-  if (!tags.includes(tag)) {
-    throw new Error(`Upstream tag not found in ${upstreamRepo}: ${tag}`)
+  if (requestedTag && !tags.includes(requestedTag)) {
+    throw new Error(`Upstream tag not found in ${upstreamRepo}: ${requestedTag}`)
   }
 
-  const releaseTag = releaseTagFor(tag)
-  const assetName = ipaAssetName(tag)
-  const shaName = `${assetName}.sha256`
-  const release = await getReleaseByTag(targetRepo(), releaseTag)
-  const assets = release ? await listReleaseAssets(targetRepo(), release.id) : []
-  const hasIpa = assets.some(asset => asset.name === assetName)
-  const hasSha = assets.some(asset => asset.name === shaName)
-  const shouldBuild = forceRebuild || !(hasIpa && hasSha) ? 'true' : 'false'
+  const altStorePath = options.altStore || 'alt_store.json'
+  const candidates = requestedTag ? [requestedTag] : tags.slice(0, tagScanLimit)
+
+  let target = null
+  let unpublished = null
+
+  for (const candidate of candidates) {
+    const built = await hasBuiltAssets(candidate)
+    const published = altStoreHasVersion(altStorePath, candidate)
+    console.log(
+      `${candidate}: ${built ? 'built' : 'no IPA assets'}, ${published ? 'in the AltStore source' : 'not in the AltStore source'}`
+    )
+
+    if (!built) {
+      target = { tag: candidate, shouldBuild: true }
+      break
+    }
+
+    // Built but never published: a previous run died between the upload and
+    // the commit. Newest such tag wins, and it is fixed without a rebuild.
+    if (!published && !unpublished) unpublished = candidate
+  }
+
+  if (!target) target = { tag: unpublished || candidates[0], shouldBuild: false }
+
+  const tag = target.tag
+  const shouldBuild = forceRebuild || target.shouldBuild
+  const altStoreNeedsUpdate = shouldBuild || !altStoreHasVersion(altStorePath, tag)
 
   setOutput('tag', tag)
-  setOutput('release_tag', releaseTag)
-  setOutput('asset_name', assetName)
-  setOutput('sha_name', shaName)
-  setOutput('should_build', shouldBuild)
+  setOutput('release_tag', releaseTagFor(tag))
+  setOutput('asset_name', ipaAssetName(tag))
+  setOutput('sha_name', `${ipaAssetName(tag)}.sha256`)
+  setOutput('metadata_name', `${ipaAssetName(tag)}.metadata.json`)
+  setOutput('should_build', String(shouldBuild))
+  setOutput('altstore_needs_update', String(altStoreNeedsUpdate))
 
-  console.log(`Upstream tag: ${tag}`)
-  console.log(`Target release: ${releaseTag}`)
-  console.log(
-    forceRebuild
-      ? `Force rebuild requested; existing ${assetName} and ${shaName} will be replaced if present.`
-      : hasIpa && hasSha
-      ? `Existing IPA and checksum assets found: ${assetName}, ${shaName}`
-      : `IPA assets will be built: ${assetName}, ${shaName}`,
-  )
+  console.log(`Target upstream tag: ${tag}`)
+  console.log(`Build IPA: ${shouldBuild}${forceRebuild ? ' (forced)' : ''}`)
+  console.log(`Update AltStore source: ${altStoreNeedsUpdate}`)
 }
 
 async function uploadCommand(options) {
   const tag = requiredOption(options, 'tag')
   const ipaPath = requiredOption(options, 'ipa')
   const shaPath = requiredOption(options, 'sha')
+  const metadataPath = (options.metadata || '').trim()
 
   if (!semverTagPattern.test(tag)) {
     throw new Error(`Upstream tag must match x.y.z, got: ${tag}`)
@@ -73,31 +102,65 @@ async function uploadCommand(options) {
 
   ensureFile(ipaPath)
   ensureFile(shaPath)
+  if (metadataPath) ensureFile(metadataPath)
 
   const repo = targetRepo()
-  const releaseTag = releaseTagFor(tag)
   const assetName = ipaAssetName(tag)
   const shaName = `${assetName}.sha256`
-  const release = await ensureRelease(repo, tag, releaseTag)
+  const metadataName = `${assetName}.metadata.json`
+  const release = await ensureRelease(repo, tag, releaseTagFor(tag))
   const assets = await listReleaseAssets(repo, release.id)
-  const hasIpa = assets.some(asset => asset.name === assetName)
-  const hasSha = assets.some(asset => asset.name === shaName)
   const forceRebuild = isTruthy(process.env.FORCE_REBUILD)
 
-  if (hasIpa && hasSha && !forceRebuild) {
+  const present = new Set(assets.map(asset => asset.name))
+  if (present.has(assetName) && present.has(shaName) && !forceRebuild) {
     console.log(`Release already has ${assetName} and ${shaName}; leaving them unchanged.`)
     return
   }
 
-  for (const asset of assets.filter(asset => asset.name === assetName || asset.name === shaName)) {
+  const replacing = new Set([assetName, shaName, metadataName])
+  for (const asset of assets.filter(asset => replacing.has(asset.name))) {
     await deleteReleaseAsset(repo, asset.id)
   }
 
   await uploadAsset(release.upload_url, ipaPath, assetName, 'application/octet-stream')
   await uploadAsset(release.upload_url, shaPath, shaName, 'text/plain; charset=utf-8')
+  if (metadataPath) {
+    await uploadAsset(release.upload_url, metadataPath, metadataName, 'application/json')
+  }
 
-  console.log(`Uploaded ${assetName} and ${shaName}`)
+  console.log(`Uploaded ${assetName}, ${shaName}${metadataPath ? `, ${metadataName}` : ''}`)
   console.log(`Release URL: ${release.html_url}`)
+}
+
+/** True when the release for this tag already carries both required assets. */
+async function hasBuiltAssets(tag) {
+  const release = await getReleaseByTag(targetRepo(), releaseTagFor(tag))
+  if (!release) return false
+
+  const assets = await listReleaseAssets(targetRepo(), release.id)
+  const names = new Set(assets.map(asset => asset.name))
+
+  return names.has(ipaAssetName(tag)) && names.has(`${ipaAssetName(tag)}.sha256`)
+}
+
+/**
+ * The AltStore source is the actual deliverable, so "already built" is not the
+ * same question as "already published". Reading the committed file keeps a run
+ * that uploaded assets but died before committing recoverable on the next run.
+ */
+function altStoreHasVersion(path, version) {
+  if (!existsSync(path)) return false
+
+  try {
+    const source = JSON.parse(readFileSync(path, 'utf8'))
+    return (source.apps || []).some(app =>
+      (app.versions || []).some(entry => entry.version === version)
+    )
+  } catch (error) {
+    console.log(`::warning::Could not read ${path} (${error.message}); assuming it needs an update.`)
+    return false
+  }
 }
 
 async function listUpstreamSemverTags() {
@@ -128,38 +191,26 @@ async function listUpstreamSemverTags() {
 
 async function ensureRelease(repo, upstreamTag, releaseTag) {
   const existing = await getReleaseByTag(repo, releaseTag)
-  const body = releaseBody(upstreamTag)
+  const payload = {
+    name: releaseName(upstreamTag),
+    body: releaseBody(upstreamTag),
+    prerelease: false,
+    draft: false,
+    make_latest: 'false'
+  }
 
   if (existing) {
-    return githubJson(`/repos/${repo}/releases/${existing.id}`, {
-      method: 'PATCH',
-      body: {
-        name: releaseName(upstreamTag),
-        body,
-        prerelease: false,
-        draft: false,
-        make_latest: 'false',
-      },
-    })
+    return githubJson(`/repos/${repo}/releases/${existing.id}`, { method: 'PATCH', body: payload })
   }
 
   return githubJson(`/repos/${repo}/releases`, {
     method: 'POST',
-    body: {
-      tag_name: releaseTag,
-      name: releaseName(upstreamTag),
-      body,
-      prerelease: false,
-      draft: false,
-      make_latest: 'false',
-    },
+    body: { tag_name: releaseTag, ...payload }
   })
 }
 
 async function getReleaseByTag(repo, tag) {
-  return githubJson(`/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, {
-    allow404: true,
-  })
+  return githubJson(`/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, { allow404: true })
 }
 
 async function listReleaseAssets(repo, releaseId) {
@@ -169,56 +220,82 @@ async function listReleaseAssets(repo, releaseId) {
 async function deleteReleaseAsset(repo, assetId) {
   await githubJson(`/repos/${repo}/releases/assets/${assetId}`, {
     method: 'DELETE',
-    expectJson: false,
+    expectJson: false
   })
 }
 
 async function uploadAsset(uploadUrlTemplate, filePath, name, contentType) {
   const uploadUrl = `${uploadUrlTemplate.replace(/\{.*$/, '')}?name=${encodeURIComponent(name)}`
   const size = statSync(filePath).size
-  const response = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: githubHeaders({
-      'Content-Type': contentType,
-      'Content-Length': String(size),
-    }),
-    body: createReadStream(filePath),
-    duplex: 'half',
-  })
 
-  if (!response.ok) {
-    throw new Error(`GitHub upload failed (${response.status}): ${await response.text()}`)
-  }
+  await withRetry(`upload ${name}`, async () => {
+    const response = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: githubHeaders({ 'Content-Type': contentType, 'Content-Length': String(size) }),
+      body: createReadStream(filePath),
+      duplex: 'half'
+    })
+
+    if (!response.ok) {
+      throw new HttpError(response.status, `GitHub upload failed (${response.status}): ${await response.text()}`)
+    }
+  })
 }
 
 async function githubJson(path, options = {}) {
-  const {
-    method = 'GET',
-    body,
-    allow404 = false,
-    expectJson = true,
-  } = options
+  const { method = 'GET', body, allow404 = false, expectJson = true } = options
 
-  const response = await fetch(`${apiBase}${path}`, {
-    method,
-    headers: githubHeaders(body ? { 'Content-Type': 'application/json' } : {}),
-    body: body ? JSON.stringify(body) : undefined,
+  return withRetry(`${method} ${path}`, async () => {
+    const response = await fetch(`${apiBase}${path}`, {
+      method,
+      headers: githubHeaders(body ? { 'Content-Type': 'application/json' } : {}),
+      body: body ? JSON.stringify(body) : undefined
+    })
+
+    if (allow404 && response.status === 404) return null
+
+    if (!response.ok) {
+      throw new HttpError(
+        response.status,
+        `GitHub API ${method} ${path} failed (${response.status}): ${await response.text()}`
+      )
+    }
+
+    if (!expectJson || response.status === 204) return null
+
+    return response.json()
   })
+}
 
-  if (allow404 && response.status === 404) {
-    return null
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.status = status
+  }
+}
+
+function isRetryable(error) {
+  if (error instanceof HttpError) return error.status === 429 || error.status >= 500
+  return true // network-level failure
+}
+
+async function withRetry(label, run) {
+  let lastError
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await run()
+    } catch (error) {
+      lastError = error
+      if (attempt === maxAttempts || !isRetryable(error)) break
+
+      const delay = 2 ** attempt * 500
+      console.log(`Retrying ${label} in ${delay}ms (attempt ${attempt}/${maxAttempts}): ${error.message}`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
   }
 
-  if (!response.ok) {
-    const message = await response.text()
-    throw new Error(`GitHub API ${method} ${path} failed (${response.status}): ${message}`)
-  }
-
-  if (!expectJson || response.status === 204) {
-    return null
-  }
-
-  return response.json()
+  throw lastError
 }
 
 function githubHeaders(extra = {}) {
@@ -226,7 +303,7 @@ function githubHeaders(extra = {}) {
     Accept: 'application/vnd.github+json',
     Authorization: `Bearer ${githubToken()}`,
     'X-GitHub-Api-Version': apiVersion,
-    ...extra,
+    ...extra
   }
 }
 
@@ -243,14 +320,14 @@ function parseArgs(argv) {
 
     const equalsIndex = arg.indexOf('=')
     if (equalsIndex > -1) {
-      options[arg.slice(2, equalsIndex)] = arg.slice(equalsIndex + 1)
+      options[camelCase(arg.slice(2, equalsIndex))] = arg.slice(equalsIndex + 1)
       continue
     }
 
-    const key = arg.slice(2)
+    const key = camelCase(arg.slice(2))
     const value = rest[index + 1]
     if (!value || value.startsWith('--')) {
-      throw new Error(`Missing value for --${key}`)
+      throw new Error(`Missing value for --${arg.slice(2)}`)
     }
 
     options[key] = value
@@ -258,6 +335,10 @@ function parseArgs(argv) {
   }
 
   return { command, options }
+}
+
+function camelCase(name) {
+  return name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())
 }
 
 function compareSemverDesc(left, right) {
@@ -283,8 +364,10 @@ function releaseBody(tag) {
     `Source: https://github.com/${upstreamRepo}/tree/${tag}`,
     `Source archive: https://github.com/${upstreamRepo}/archive/refs/tags/${tag}.zip`,
     'The IPA is intentionally unsigned and should be signed by your sideloading tool or a later signing workflow.',
-    runUrl ? `Build run: ${runUrl}` : null,
-  ].filter(Boolean).join('\n\n')
+    runUrl ? `Build run: ${runUrl}` : null
+  ]
+    .filter(Boolean)
+    .join('\n\n')
 }
 
 function releaseName(tag) {
