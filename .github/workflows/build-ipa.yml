@@ -56,6 +56,17 @@ jobs:
           echo "TAG=v$version" >> "$GITHUB_ENV"
           echo "App version: $version (app.json: $app_version)"
 
+          # ios/ 是入库的, 这条流水线不跑 prebuild, 所以 Info.plist 里的
+          # CFBundleShortVersionString 是生成那一刻的字面量, 不会随 app.json 变。
+          # app.json 一升版本, 装上去的包就会自报旧版本, AltStore 两边一比对,
+          # 更新提示永远消不掉。构建前按本次版本同步 (只改 CI 检出的副本)。
+          plist="ios/Bangumi/Info.plist"
+          plist_version="$(plutil -extract CFBundleShortVersionString raw -o - "$plist")"
+          if [ "$plist_version" != "$version" ]; then
+            plutil -replace CFBundleShortVersionString -string "$version" "$plist"
+            echo "::notice::$plist 里写的是 $plist_version, 已同步为 $version"
+          fi
+
       - name: Install JavaScript dependencies
         run: |
           set -euo pipefail
@@ -90,7 +101,25 @@ jobs:
           }
 
           cd ios
+
+          # 入库的 Podfile.lock 是生成那一刻的快照, 而仓库没有 yarn.lock:
+          # package.json 里 ~57.0.21 这类范围每次都重新解析, Expo 发个补丁版本,
+          # node_modules 里的本地 podspec 就和锁里钉的版本错位, pod install 直接拒绝。
+          # 只对这一种失败兜底 —— 丢掉过期的锁按当前依赖重新解析一次;
+          # 真正的版本冲突不含这句提示, 仍按原样失败。
+          pod_ok=false
           if pod install 2>&1 | tee "$RUNNER_TEMP/pod-install.log"; then
+            pod_ok=true
+          elif grep -qF "changed the version of the dependency" "$RUNNER_TEMP/pod-install.log"; then
+            drifted="$(grep -oE 'dependency `[^`]+`' "$RUNNER_TEMP/pod-install.log" | tr -d '`' | awk '{print $2}' | sort -u | tr '\n' ' ')"
+            echo "::warning::入库的 ios/Podfile.lock 与当前 node_modules 不一致 (${drifted}), 已按当前依赖重新解析。请更新入库的 Podfile.lock。"
+            rm -f Podfile.lock
+            if pod install 2>&1 | tee "$RUNNER_TEMP/pod-install.log"; then
+              pod_ok=true
+            fi
+          fi
+
+          if [ "$pod_ok" = true ]; then
             echo "pod install OK"
           else
             {
@@ -107,10 +136,19 @@ jobs:
             exit 1
           fi
 
+          # fmt 用 __apple_build_version__ < 14000029L 判断要不要绕开一个 clang 问题,
+          # 新版工具链会踩到。三种结果都打印出来: 之前这里 gsub 匹配不到会无声跳过,
+          # 等到编译报错才发现补丁早就失效了。
           fmt_base_h="Pods/fmt/include/fmt/base.h"
-          if [ -f "$fmt_base_h" ]; then
+          fmt_guard='defined(__apple_build_version__) && __apple_build_version__ < 14000029L'
+
+          if [ ! -f "$fmt_base_h" ]; then
+            echo "::notice::这套依赖里没有 Pods/fmt, 跳过 fmt 兼容补丁"
+          elif grep -qF "$fmt_guard" "$fmt_base_h"; then
             ruby -0777 -pi -e 'gsub("defined(__apple_build_version__) && __apple_build_version__ < 14000029L", "defined(__apple_build_version__)")' "$fmt_base_h"
             echo "Patched fmt for Xcode clang compatibility"
+          else
+            echo "::notice::fmt 已不带 __apple_build_version__ 判断, 跳过兼容补丁"
           fi
 
       - name: Upload pod install log
@@ -213,6 +251,43 @@ jobs:
             exit 1
           fi
 
+          # app.json 不声明 userInterfaceStyle 时 Expo 默认按 "light" 生成,
+          # prebuild 会写进 UIUserInterfaceStyle=Light, 在 UIKit 层把应用钉死在亮色,
+          # Appearance.getColorScheme() 永远返回 light, 应用内的"跟随系统"静默失效。
+          interface_style="$(plutil -extract UIUserInterfaceStyle raw -o - "$info_plist" 2>/dev/null || echo '')"
+          case "$interface_style" in
+            Automatic|Dark) echo "UIUserInterfaceStyle: $interface_style" ;;
+            Light) echo "::error::UIUserInterfaceStyle 为 Light, 主题跟随系统无法工作"; exit 1 ;;
+            '') echo "::error::Info.plist 缺少 UIUserInterfaceStyle"; exit 1 ;;
+            *) echo "::error::UIUserInterfaceStyle 取值异常: $interface_style"; exit 1 ;;
+          esac
+
+          bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$info_plist" 2>/dev/null || echo '')"
+          case "$bundle_id" in
+            ''|*'$('*) echo "::error::CFBundleIdentifier 未在构建时替换: '$bundle_id'"; exit 1 ;;
+          esac
+
+          # 只查版本号的话, 一个 JS bundle 阶段被跳过的空壳包也能完整通过校验
+          work_dir="$(mktemp -d)"
+          unzip -p "$IPA_PATH" "Payload/Bangumi.app/main.jsbundle" > "$work_dir/main.jsbundle" 2>/dev/null || {
+            echo "::error::IPA 里没有 main.jsbundle"; exit 1; }
+          bundle_bytes="$(stat -f%z "$work_dir/main.jsbundle")"
+          [ "$bundle_bytes" -ge 1048576 ] || {
+            echo "::error::main.jsbundle 只有 $bundle_bytes 字节, Metro/Hermes 阶段没有产出真正的 bundle"; exit 1; }
+          hermes_magic="$(od -An -tx1 -N4 "$work_dir/main.jsbundle" | tr -d ' \n')"
+          [ "$hermes_magic" = "c61fbc03" ] ||
+            echo "::warning::main.jsbundle 不是 Hermes 字节码 (magic $hermes_magic)"
+
+          unzip -p "$IPA_PATH" "Payload/Bangumi.app/Bangumi" > "$work_dir/Bangumi" 2>/dev/null
+          archs="$(lipo -archs "$work_dir/Bangumi" 2>/dev/null || echo '')"
+          case "$archs" in
+            *arm64*) echo "架构: $archs" ;;
+            *) echo "::error::可执行文件不含 arm64 (lipo: '${archs:-读不出}')"; exit 1 ;;
+          esac
+          rm -rf "$work_dir"
+
+          echo "IPA 校验通过: $bundle_version, $interface_style, jsbundle ${bundle_bytes} 字节"
+
           app_path="ios/build/Build/Products/Release-iphoneos/Bangumi.app"
           set +e
           codesign_output="$(codesign -dv "$app_path" 2>&1)"
@@ -230,6 +305,15 @@ jobs:
             echo "::error::codesign did not report the expected unsigned-app message."
             exit 1
           fi
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-${{ env.VERSION }}
+          path: |
+            ${{ env.IPA_PATH }}
+            ${{ env.SHA_PATH }}
+          retention-days: 14
 
       - name: Upload release assets
         if: startsWith(github.ref, 'refs/tags/')
@@ -260,19 +344,36 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # tag 构建时 checkout 的是浅克隆标签, 没有 origin/master 引用, 用 FETCH_HEAD 对齐
-          git fetch --depth=1 origin master
-          git reset --hard FETCH_HEAD
+          # 下面会 reset 到 origin/master, 先把生成脚本挪出工作区
+          generator="$RUNNER_TEMP/generate-altstore.py"
+          cp .github/scripts/generate-altstore.py "$generator"
 
-          python3 .github/scripts/generate-altstore.py \
-            --version "$VERSION" \
-            --output alt_store.json
+          # 期间可能有别的推送落到 master, 基于最新的 master 重新生成再试
+          for attempt in 1 2 3 4 5; do
+            git fetch --depth=1 origin master
+            git reset --hard FETCH_HEAD
 
-          git add alt_store.json
+            python3 "$generator" \
+              --version "$VERSION" \
+              --output alt_store.json
 
-          if git diff --cached --quiet; then
-            echo "alt_store.json already up to date."
-            exit 0
-          fi
+            git add alt_store.json
 
-          git commit -m "chore: update AltStore source $TAG"
-          git push origin HEAD:master
+            if git diff --cached --quiet; then
+              echo "alt_store.json already up to date."
+              exit 0
+            fi
+
+            git commit -m "chore: update AltStore source $TAG"
+
+            if git push origin HEAD:master; then
+              echo "Published alt_store.json for $TAG."
+              exit 0
+            fi
+
+            echo "::notice::第 $attempt 次推送被拒, 重新基于 master 生成后重试"
+            sleep $((attempt * 5))
+          done
+
+          echo "::error::alt_store.json 推送 5 次均失败"
+          exit 1

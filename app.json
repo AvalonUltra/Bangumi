@@ -44,6 +44,7 @@
       "ios"
     ],
     "orientation": "default",
+    "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "tv.bangumi.czy0729",
       "supportsTablet": true,
