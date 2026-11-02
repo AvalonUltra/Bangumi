@@ -423,6 +423,7 @@ jobs:
           cat > "$notes_file" << EOF
           上游 [${UPSTREAM_REPO}@${VERSION}](https://github.com/${UPSTREAM_REPO}/tree/${VERSION}) 的 iOS 未签名 IPA。
 
+          - 源码: tag \`${VERSION}\`, 提交 [\`${SOURCE_SHA}\`](https://github.com/${UPSTREAM_REPO}/commit/${SOURCE_SHA})
           - 附件: \`${ASSET_NAME}\` (${IPA_BYTES} 字节)
           - SHA-256: \`${sha256}\`
           - 构建: ${XCODE_APP} / iOS ${IOS_SDK} SDK, [运行记录](${run_url})
@@ -433,12 +434,10 @@ jobs:
           if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "Release $RELEASE_TAG 已存在, 覆盖附件"
             gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file "$notes_file"
-          elif ! gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
-              --target "$SOURCE_SHA" \
-              --title "Bangumi $VERSION (iOS 未签名)" \
-              --notes-file "$notes_file"; then
-            # fork 还没同步到这个版本的提交时, tag 打在默认分支上
-            echo "::warning::本仓库没有提交 $SOURCE_SHA, Release tag 改为指向默认分支"
+          else
+            # tag 打在本仓库默认分支上。GITHUB_TOKEN 没有 workflows 权限, 在上游源码提交上建 tag
+            # (它的 .github/workflows 与默认分支不同) 会被拒 (HTTP 403 Resource not accessible by integration)。
+            # 构建用的确切源码写在 release 说明里 (上游 tag 与提交 SHA)。
             gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
               --title "Bangumi $VERSION (iOS 未签名)" \
               --notes-file "$notes_file"
