@@ -131,6 +131,9 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
+          # 上游 package.json 声明了 packageManager, setup-node v5 会据此自动开启依赖缓存,
+          # 而上游不提交 yarn.lock, 缓存找不到锁文件会直接让这一步失败
+          package-manager-cache: false
 
       - name: Select Xcode ${{ env.XCODE_MAJOR }}.x
         run: |
