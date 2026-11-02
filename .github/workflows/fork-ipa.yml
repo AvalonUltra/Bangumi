@@ -1,0 +1,450 @@
+name: Fork - 打包上游最新版本未签名 IPA
+
+# fork 专用 (上游没有这个文件, 以后同步上游不会产生冲突)
+#
+# 触发:
+#   - master 有推送时 (例如在 GitHub 上点 Sync fork 同步上游) 自动检查上游最新版本 tag,
+#     本仓库还没有对应 Release 就打包; 已经有了只跑一个几秒钟的检查 job
+#   - Actions 页手动运行, 可指定版本 / 强制重打
+#
+# 源码: czy0729/Bangumi 的版本 tag (例如 8.41.3), 与 Release 一一对应
+# 原生工程: 直接用 tag 里入库的 ios/ (Expo 57 / RN 0.86), 不跑 prebuild
+# 产物: Release upstream-<版本>, 附件 Bangumi-<版本>-unsigned.ipa 与 .sha256
+#       未签名, 需用 AltStore / SideStore / Sideloadly / TrollStore 等自行签名侧载
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要打包的上游版本 tag, 例如 8.41.3; 留空取上游最新版本'
+        required: false
+        type: string
+      force:
+        description: '已有同版本 Release 时也重新打包并覆盖附件'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-ipa
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: czy0729/Bangumi
+  NODE_VERSION: '22'
+  # 入库的 AppDelegate 仍是 window 生命周期, 没有适配 UIScene。
+  # 用 iOS 27 SDK 链接的包在 iOS 27 上会因未采用 UIScene 在启动时直接退出,
+  # 所以锁定 Xcode 26.x (iOS 26 SDK), 上游适配 UIScene 之后再放开。
+  XCODE_MAJOR: '26'
+
+jobs:
+  resolve:
+    name: 确定要打包的版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      asset_name: ${{ steps.resolve.outputs.asset_name }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+
+    steps:
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          upstream_url="https://github.com/${UPSTREAM_REPO}.git"
+
+          version="$(echo "${INPUT_VERSION:-}" | tr -d '[:space:]')"
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            version="$(git ls-remote --tags --refs "$upstream_url" \
+              | awk -F/ '{print $3}' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)"
+          fi
+
+          if [ -z "$version" ]; then
+            echo "::error::没有在 ${UPSTREAM_REPO} 找到版本 tag"
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags "$upstream_url" "refs/tags/$version" > /dev/null; then
+            echo "::error::${UPSTREAM_REPO} 没有 tag $version"
+            exit 1
+          fi
+
+          release_tag="upstream-$version"
+          asset_name="Bangumi-$version-unsigned.ipa"
+          should_build=true
+
+          if [ "${INPUT_FORCE:-false}" != "true" ] \
+            && gh release view "$release_tag" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2> /dev/null \
+              | grep -qxF "$asset_name"; then
+            should_build=false
+            echo "Release $release_tag 已有 $asset_name, 跳过打包 (需要重打请手动运行并勾选 force)"
+          fi
+
+          {
+            echo "version=$version"
+            echo "release_tag=$release_tag"
+            echo "asset_name=$asset_name"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 上游版本 \`$version\`"
+            echo
+            echo "- Release: \`$release_tag\`"
+            echo "- 需要打包: $should_build"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 打包 ${{ needs.resolve.outputs.version }}
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      ASSET_NAME: ${{ needs.resolve.outputs.asset_name }}
+
+    steps:
+      - name: Checkout ${{ env.UPSTREAM_REPO }}@${{ needs.resolve.outputs.version }}
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: refs/tags/${{ needs.resolve.outputs.version }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Select Xcode ${{ env.XCODE_MAJOR }}.x
+        run: |
+          set -euo pipefail
+
+          xcode_app="$(ls -d /Applications/Xcode_"${XCODE_MAJOR}"*.app 2> /dev/null \
+            | grep -viE 'beta|release_candidate|_rc' \
+            | sort -V | tail -n1 || true)"
+
+          if [ -z "$xcode_app" ]; then
+            echo "::error::runner 上没有 Xcode ${XCODE_MAJOR}.x, 现有: $(ls -d /Applications/Xcode*.app | tr '\n' ' ')"
+            exit 1
+          fi
+
+          developer_dir="$xcode_app/Contents/Developer"
+          sudo xcode-select -s "$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $sdk_version"
+          if [ "${sdk_version%%.*}" != "$XCODE_MAJOR" ]; then
+            echo "::error::选中的 $xcode_app 带的是 iOS $sdk_version SDK, 不是 iOS ${XCODE_MAJOR}"
+            exit 1
+          fi
+
+          echo "XCODE_APP=$(basename "$xcode_app")" >> "$GITHUB_ENV"
+          echo "IOS_SDK=$sdk_version" >> "$GITHUB_ENV"
+
+      - name: Prepare source
+        run: |
+          set -euo pipefail
+
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          # 发版偶尔有 app.json 没跟着改版本号的情况, 以 tag 为准 (只改 CI 检出的副本)。
+          # src/constants 里读 app.json 的版本做界面显示与 UA, 两处都要对齐。
+          app_version="$(node -p "require('./app.json').expo.version")"
+          if [ "$app_version" != "$VERSION" ]; then
+            echo "::warning::app.json 版本是 $app_version, 与 tag $VERSION 不一致, 以 tag 为准"
+            node -e '
+              const fs = require("fs")
+              const app = JSON.parse(fs.readFileSync("app.json", "utf8"))
+              app.expo.version = process.env.VERSION
+              fs.writeFileSync("app.json", JSON.stringify(app, null, 2) + "\n")
+            '
+          fi
+
+          # ios/ 是入库的且不跑 prebuild, Info.plist 里的版本号是写死的字面量
+          plist="ios/Bangumi/Info.plist"
+          plist_version="$(plutil -extract CFBundleShortVersionString raw -o - "$plist")"
+          if [ "$plist_version" != "$VERSION" ]; then
+            plutil -replace CFBundleShortVersionString -string "$VERSION" "$plist"
+            echo "::notice::$plist 里写的是 $plist_version, 已同步为 $VERSION"
+          fi
+
+          # 上游入库的 .xcode.env.local 指向作者本机的 nvm 路径, Xcode 的打包脚本会用它找 node
+          node_binary="$(command -v node)"
+          printf 'export NODE_BINARY=%q\n' "$node_binary" > ios/.xcode.env.local
+          echo "NODE_BINARY=$node_binary ($(node --version))"
+
+      - name: Install JavaScript dependencies
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+        run: |
+          set -euo pipefail
+
+          if ! corepack enable; then
+            echo "::warning::corepack 不可用, 改用 npm 全局安装 yarn 1.22.22"
+            npm install -g yarn@1.22.22
+          fi
+          yarn --version
+
+          # 上游不提交 yarn.lock, 每次按 package.json 的范围重新解析
+          if [ -f yarn.lock ]; then
+            frozen="--frozen-lockfile"
+          else
+            frozen=""
+          fi
+          yarn install $frozen --ignore-engines --ignore-scripts --non-interactive --network-timeout 600000
+
+          ./node_modules/.bin/patch-package
+
+          echo "expo $(node -p "require('expo/package.json').version"), react-native $(node -p "require('react-native/package.json').version")"
+
+      - name: Install CocoaPods dependencies
+        run: |
+          set -euo pipefail
+          cd ios
+          log="$RUNNER_TEMP/pod-install.log"
+          : > "$log"
+
+          pod --version
+
+          # 入库的 Podfile.lock 停在 Expo 52 时代的快照, 与 tag 里 Expo 57 的依赖对不上,
+          # 而且上游没有 yarn.lock, 补丁版本每次都可能漂移。锁的 Expo 大版本不一致时直接丢掉,
+          # 其余情况先按锁安装, 失败了再丢锁重新解析一次。
+          expo_version="$(node -p "require('../node_modules/expo/package.json').version")"
+          locked_expo="$(sed -nE 's/^  - Expo \(([0-9.]+)\).*/\1/p' Podfile.lock 2> /dev/null | head -n1 || true)"
+          if [ -f Podfile.lock ] && [ "${locked_expo%%.*}" != "${expo_version%%.*}" ]; then
+            echo "::warning::入库的 ios/Podfile.lock 锁的是 Expo ${locked_expo:-?}, 当前依赖是 Expo $expo_version, 丢弃后按当前依赖重新解析"
+            rm -f Podfile.lock
+          fi
+
+          pod_install() {
+            pod install "$@" 2>&1 | tee -a "$log"
+          }
+
+          if ! pod_install; then
+            echo "::warning::pod install 失败, 丢弃 Podfile.lock 并更新 spec 仓库后重试一次"
+            rm -f Podfile.lock
+            if ! pod_install --repo-update; then
+              echo "==================== pod install 失败, 日志末尾 ===================="
+              tail -n 120 "$log"
+              exit 1
+            fi
+          fi
+
+          # fmt 用 __apple_build_version__ < 14000029L 判断是否绕开一个 clang 问题, 新版工具链会踩到
+          fmt_base_h="Pods/fmt/include/fmt/base.h"
+          fmt_guard='defined(__apple_build_version__) && __apple_build_version__ < 14000029L'
+          if [ ! -f "$fmt_base_h" ]; then
+            echo "这套依赖里没有 Pods/fmt, 跳过 fmt 兼容补丁"
+          elif grep -qF "$fmt_guard" "$fmt_base_h"; then
+            ruby -0777 -pi -e 'gsub("defined(__apple_build_version__) && __apple_build_version__ < 14000029L", "defined(__apple_build_version__)")' "$fmt_base_h"
+            echo "已给 fmt 打上 Xcode clang 兼容补丁"
+          else
+            echo "fmt 已不带 __apple_build_version__ 判断, 跳过兼容补丁"
+          fi
+
+      - name: Build Release app (unsigned)
+        env:
+          NODE_ENV: production
+          ENTRY_FILE: index.js
+        run: |
+          set -euo pipefail
+          cd ios
+          log="$RUNNER_TEMP/xcodebuild.log"
+
+          set +e
+          xcodebuild \
+            -workspace Bangumi.xcworkspace \
+            -scheme Bangumi \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination generic/platform=iOS \
+            -derivedDataPath build \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            GCC_WARN_INHIBIT_ALL_WARNINGS=YES \
+            CLANG_WARN_DOCUMENTATION_COMMENTS=NO \
+            SWIFT_SUPPRESS_WARNINGS=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$log" | grep --line-buffered -E '=== BUILD TARGET|\*\* BUILD|error: |PhaseScriptExecution'
+          status="${PIPESTATUS[0]}"
+          set -e
+
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### xcodebuild 失败"
+              echo '```'
+              grep -E 'error: |fatal error|\*\* BUILD FAILED' "$log" | sort -u | head -n 60 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "==================== xcodebuild 错误汇总 ===================="
+            grep -nE 'error: |fatal error|Command PhaseScriptExecution failed|\*\* BUILD FAILED' "$log" | head -n 80 || true
+            echo "==================== xcodebuild 日志末尾 ===================="
+            tail -n 150 "$log"
+            exit "$status"
+          fi
+
+          tail -n 5 "$log"
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ env.VERSION }}
+          path: |
+            ${{ runner.temp }}/pod-install.log
+            ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+
+          app_path="ios/build/Build/Products/Release-iphoneos/Bangumi.app"
+          if [ ! -d "$app_path" ]; then
+            echo "::error::没有找到 $app_path"
+            exit 1
+          fi
+
+          payload_root="$RUNNER_TEMP/ipa-payload"
+          rm -rf "$payload_root"
+          mkdir -p "$payload_root/Payload"
+          cp -R "$app_path" "$payload_root/Payload/"
+
+          out_dir="$RUNNER_TEMP/out"
+          mkdir -p "$out_dir"
+          (cd "$payload_root" && zip -qry "$out_dir/$ASSET_NAME" Payload)
+          (cd "$out_dir" && shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256")
+
+          echo "IPA_PATH=$out_dir/$ASSET_NAME" >> "$GITHUB_ENV"
+          echo "SHA_PATH=$out_dir/$ASSET_NAME.sha256" >> "$GITHUB_ENV"
+          ls -la "$out_dir"
+
+      - name: Validate IPA
+        run: |
+          set -euo pipefail
+
+          unzip -tq "$IPA_PATH"
+          work_dir="$(mktemp -d)"
+          unzip -q "$IPA_PATH" -d "$work_dir"
+          app="$work_dir/Payload/Bangumi.app"
+          info_plist="$app/Info.plist"
+
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
+          if [ "$bundle_version" != "$VERSION" ]; then
+            echo "::error::包内版本 $bundle_version 与 $VERSION 不一致"
+            exit 1
+          fi
+
+          bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$info_plist" 2> /dev/null || echo '')"
+          case "$bundle_id" in
+            '' | *'$('*) echo "::error::CFBundleIdentifier 没有在构建时替换: '$bundle_id'"; exit 1 ;;
+          esac
+
+          # UIUserInterfaceStyle=Light 会在 UIKit 层把应用钉死在亮色, 应用内"跟随系统"失效
+          interface_style="$(plutil -extract UIUserInterfaceStyle raw -o - "$info_plist" 2> /dev/null || echo '')"
+          case "$interface_style" in
+            Automatic | Dark | '') echo "UIUserInterfaceStyle: ${interface_style:-未设置}" ;;
+            *) echo "::error::UIUserInterfaceStyle 为 $interface_style, 主题跟随系统会失效"; exit 1 ;;
+          esac
+
+          # 只查版本号的话, JS 打包阶段被跳过的空壳包也能通过
+          bundle="$app/main.jsbundle"
+          if [ ! -f "$bundle" ]; then
+            echo "::error::包里没有 main.jsbundle"
+            exit 1
+          fi
+          bundle_bytes="$(stat -f%z "$bundle")"
+          if [ "$bundle_bytes" -lt 1048576 ]; then
+            echo "::error::main.jsbundle 只有 $bundle_bytes 字节, JS 没有真正打进包里"
+            exit 1
+          fi
+          hermes_magic="$(od -An -tx1 -N4 "$bundle" | tr -d ' \n')"
+          if [ "$hermes_magic" != "c61fbc03" ]; then
+            echo "::warning::main.jsbundle 不是 Hermes 字节码 (magic $hermes_magic)"
+          fi
+
+          archs="$(lipo -archs "$app/Bangumi" 2> /dev/null || echo '')"
+          case "$archs" in
+            *arm64*) echo "可执行文件架构: $archs" ;;
+            *) echo "::error::可执行文件不含 arm64 (lipo: '${archs:-读不出}')"; exit 1 ;;
+          esac
+
+          set +e
+          codesign_output="$(codesign -dv "$app" 2>&1)"
+          codesign_status="$?"
+          set -e
+          if [ "$codesign_status" -eq 0 ] || [[ "$codesign_output" != *"not signed at all"* ]]; then
+            echo "$codesign_output"
+            echo "::error::预期是未签名的包"
+            exit 1
+          fi
+
+          ipa_bytes="$(stat -f%z "$IPA_PATH")"
+          echo "IPA_BYTES=$ipa_bytes" >> "$GITHUB_ENV"
+          echo "校验通过: $VERSION, jsbundle $bundle_bytes 字节, IPA $ipa_bytes 字节"
+          rm -rf "$work_dir"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          sha256="$(awk '{print $1}' "$SHA_PATH")"
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes_file" << EOF
+          上游 [${UPSTREAM_REPO}@${VERSION}](https://github.com/${UPSTREAM_REPO}/tree/${VERSION}) 的 iOS 未签名 IPA。
+
+          - 附件: \`${ASSET_NAME}\` (${IPA_BYTES} 字节)
+          - SHA-256: \`${sha256}\`
+          - 构建: ${XCODE_APP} / iOS ${IOS_SDK} SDK, [运行记录](${run_url})
+
+          未签名, 需要用 AltStore / SideStore / Sideloadly / TrollStore 等工具自行签名后安装。
+          EOF
+
+          if gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在, 覆盖附件"
+            gh release edit "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --notes-file "$notes_file"
+          elif ! gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "Bangumi $VERSION (iOS 未签名)" \
+              --notes-file "$notes_file"; then
+            # fork 还没同步到这个版本的提交时, tag 打在默认分支上
+            echo "::warning::本仓库没有提交 $SOURCE_SHA, Release tag 改为指向默认分支"
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Bangumi $VERSION (iOS 未签名)" \
+              --notes-file "$notes_file"
+          fi
+
+          gh release upload "$RELEASE_TAG" "$IPA_PATH" "$SHA_PATH" -R "$GITHUB_REPOSITORY" --clobber
+
+          {
+            echo "### 已发布 \`$RELEASE_TAG\`"
+            echo
+            echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
